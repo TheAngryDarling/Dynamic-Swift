@@ -5,7 +5,7 @@
 
 
 ## dswift
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;A shell script that dynamically generates swift code .dswfit files within SwiftPM projects<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;A shell script that dynamically generates swift code from .dswift files within SwiftPM projects<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Usage</b><br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Inline Block: <%=...%><br/>
