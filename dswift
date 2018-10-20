@@ -1,0 +1,1069 @@
+#!/usr/bin/swift
+
+//
+//  dswift
+//  Dynamically generates swift code for SwiftPM projects
+//  Block identifiers:
+//      Inline Block: <%=...%>
+//                   Used for adding dynamic value to content
+//                   Evaluates to "\(...)"
+//      Class Code: <%! ... %>
+//                  Used to add class variables and functions
+//                  Any content in this block is copied to the classLevel of the generator classadd
+//      Generator Code: <% ... %>
+//                  Used to add code within the generator function.  Good for wrapping loops around static content with Inline Blocks
+//                  Any content in this block is copied to the generator funcion
+//  Created by Tyler Anger on 2018-10-20.
+//  Copyright © 2018 Tyler Anger. All rights reserved.
+//
+
+import Foundation
+
+typealias InitFunction = @convention(c) () -> AnyObject
+
+let dSwiftModuleName: String = "dswift"
+let dSwiftURL: String = "https://github.com/TheAngryDarling/Dynamic-Swift"
+
+func print(_ msg: String) {
+    Swift.print(msg)
+    fflush(stdout)
+}
+
+
+extension URL {
+    var isPathDirectory: Bool {
+        var isDir: ObjCBool = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: self.path, isDirectory: &isDir) else { return false }
+        return isDir.boolValue
+    }
+    
+    var isPathFile: Bool {
+        var isDir: ObjCBool = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: self.path, isDirectory: &isDir) else { return false }
+        return !isDir.boolValue
+    }
+    
+    var pathModificationDate: Date? {
+        do {
+            let attr = try FileManager.default.attributesOfItem(atPath: self.path)
+            return attr[FileAttributeKey.modificationDate] as? Date
+        } catch {
+            return nil
+        }
+    }
+    
+    
+    var pathCreationDate: Date? {
+        do {
+            let attr = try FileManager.default.attributesOfItem(atPath: self.path)
+            return attr[FileAttributeKey.creationDate] as? Date
+        } catch {
+            return nil
+        }
+    }
+}
+extension String: Error { }
+// Path Properties
+extension String {
+    var pathComponents: [String] {
+        guard self != "/" else { return [self] }
+        var comps = self.components(separatedBy: "/")
+        if self.hasPrefix("/") && comps[0] == "" {
+            comps[0] = "/"
+        }
+        if self.hasSuffix("/") && comps[comps.count - 1] == "" {
+            comps[comps.count - 1] = "/"
+        }
+        
+        return comps
+        
+    }
+    
+    var lastPathComponent: String {
+        let comps = self.pathComponents
+        var rtn = comps[comps.count - 1]
+        if rtn == "/" && comps.count > 1 { rtn =  comps[comps.count - 2]}
+        return rtn
+    }
+    
+    var pathExtension: String {
+        var comps = self.pathComponents
+        if comps.count > 1 && comps[comps.count - 1] == "/" {
+            comps.removeLast()
+        }
+        let file = comps[comps.count - 1]
+        guard let idx = file.lastIndex(of: ".") else { return "" }
+        return String(file.suffix(from: file.index(after: idx)))
+    }
+    
+    var deletingPathExtension: String {
+        var comps = self.pathComponents
+        if comps.count > 1 && comps[comps.count - 1] == "/" {
+            comps.removeLast()
+        }
+        if let idx = comps[comps.count - 1].lastIndex(of: ".") {
+            comps[comps.count - 1] = String(comps[comps.count - 1].prefix(upTo: idx))
+        }
+        var startValue = comps.removeFirst()
+        if comps.count > 0 && startValue == "/" { startValue = "" }
+        let rtn: String = comps.reduce(startValue) { return $0 + "/" + $1 }
+        
+        return rtn
+    }
+}
+
+extension String {
+    func repeated(_ times: Int) -> String {
+        guard times > 0 else { return "" }
+        return Array<String>(repeating: self, count: times).reduce("", +)
+    }
+    
+    
+    #if os(Linux)
+    func lastIndex(of: String) -> String.Index? {
+        guard let r = self.range(of: of, options: .backwards) else { return nil }
+        return r.lowerBound
+    }
+    #endif
+}
+
+class DynamicSourceCodeGenerator {
+
+    class DynamicSourceCodeBuilder {
+        
+        enum CodeBlockDefinition {
+            
+            var openingBrace: String {
+                switch (self) {
+                    case .basic(let opening, _) : return opening
+                    case .static(let opening, _): return opening
+                    case .inline(let opening, _): return opening
+                    case .text: return ""
+                }
+            }
+            
+            var closingBrace: String {
+                switch (self) {
+                    case .basic(_, let closing) : return closing
+                    case .static(_, let closing): return closing
+                    case .inline(_, let closing): return closing
+                    case .text: return ""
+                }
+            }
+            
+            
+            
+            var isBasicBlock: Bool {
+                if case .basic = self { return true }
+                else { return false }
+            }
+            
+            var isStaticBlock: Bool {
+                if case .static(_, _) = self { return true }
+                else { return false }
+            }
+            
+            var isInlineBlock: Bool {
+                if case .inline = self { return true }
+                else { return false }
+            }
+            
+            var isTextBlock: Bool {
+                if case .text = self { return true }
+                else { return false }
+            }
+            
+            case basic(opening: String, closing: String)
+            case `static`(opening: String, closing: String)
+            case inline(opening: String, closing: String)
+            case text
+            
+            init(basic: String, closing: String = "") {
+                self = .basic(opening: basic, closing: closing)
+            }
+            init(`static`: String, closing: String = "") {
+                self = .`static`(opening: `static`, closing: closing)
+            }
+            init(inline: String, closing: String = "") {
+                self = .inline(opening: inline, closing: closing)
+            }
+        }
+        
+        struct CodeBlockIdentifiers {
+            
+            struct CodeBlock {
+                let range: Range<String.Index>
+                let type: CodeBlockDefinition
+                let string: String
+                
+                var lines: [String] { return CodeBlock.splitBlockString(self.string) }
+                
+                let subBlockString: String?
+                var subBlockLines: [String]? {
+                    guard let l = self.subBlockString else { return nil }
+                    return CodeBlock.splitBlockString(l)
+                }
+                
+                public init(range: Range<String.Index>, type: CodeBlockDefinition, string: String, subBlockString: String? = nil) {
+                    self.range = range
+                    self.type = type
+                    self.string = string
+                    self.subBlockString = subBlockString
+                }
+                
+                private static func splitBlockString(_ string: String) -> [String] {
+                    return string.split(separator: "\n", omittingEmptySubsequences: false).map {
+                        var rtn = String($0)
+                        if String($0).hasSuffix("\r") {  rtn.removeLast() }
+                        return rtn
+                    }
+                }
+            }
+            
+            let opening: String
+            let closing: String
+            
+            let blocks: [CodeBlockDefinition]
+            
+            var maxOpeningBlockSize: Int {
+                var maxBlockSize: Int = 0
+                for b in self.blocks {
+                    if b.openingBrace.count > maxBlockSize { maxBlockSize  = b.openingBrace.count }
+                }
+                return (self.opening.count + maxBlockSize)
+            }
+            var minOpeningBlockSize: Int {
+                var minBlockSize: Int = self.blocks[0].openingBrace.count
+                for b in self.blocks {
+                    if b.openingBrace.count < minBlockSize { minBlockSize  = b.openingBrace.count }
+                }
+                return (self.opening.count + minBlockSize)
+            }
+            
+            var maxClosingBlockSize: Int {
+                var maxBlockSize: Int = 0
+                for b in self.blocks {
+                    if b.closingBrace.count > maxBlockSize { maxBlockSize  = b.closingBrace.count }
+                }
+                return (self.closing.count + maxBlockSize)
+            }
+            var minClosingBlockSize: Int {
+                var minBlockSize: Int = self.blocks[0].closingBrace.count
+                for b in self.blocks {
+                    if b.closingBrace.count < minBlockSize { minBlockSize  = b.closingBrace.count }
+                }
+                return (self.closing.count  + minBlockSize)
+            }
+            
+            init(opening: String, closing: String, blocks: [CodeBlockDefinition]) {
+                self.opening = opening
+                self.closing = closing
+                for b in blocks {
+                    if b.isTextBlock {
+                        preconditionFailure("Do not provide CodeBlockDefinition.text in blocks array")
+                    }
+                }
+                //Make sure that the longest opening comes first
+                self.blocks = blocks.sorted( by: { $0.openingBrace > $1.openingBrace } )
+            }
+            
+            func nextBlockSet(from string: String, startingAt: String.Index) throws -> CodeBlock? {
+                //If we are at the end index, we are done
+                guard startingAt !=  string.endIndex else { return nil }
+                // Looks for opening block brace.  If not found we return the whole string as a text block
+                guard let startBlockIndex: String.Index = string.range(of: self.opening, range:startingAt..<string.endIndex)?.lowerBound else {
+                    return CodeBlock(range: startingAt..<string.endIndex,
+                                     type: .text,
+                                     string: String(string[startingAt..<string.endIndex]))
+                }
+                
+                // Ensures that the opening of the block is at the starting index, otherwise we return a text block from startingAt to the beginning of the code block
+                guard startBlockIndex == startingAt else {
+                    let str = String(string[startingAt..<startBlockIndex])
+                    return CodeBlock(range: startingAt..<startBlockIndex,
+                                     type: .text,
+                                     string: str)
+                }
+                
+                let strMaxBlockIndicator: String.Index = string.index(startBlockIndex, offsetBy: self.maxOpeningBlockSize)
+                let stringFrom: String = String(string[startBlockIndex..<strMaxBlockIndicator])
+                
+                for b in self.blocks {
+                    let op = self.opening + b.openingBrace
+                    if stringFrom.hasPrefix(op) {
+                        let ed =  b.closingBrace + self.closing
+                        guard let endBlockIndex: String.Index = string.range(of: ed, range:startBlockIndex..<string.endIndex)?.lowerBound else {
+                            throw "Missing Closing Block '\(ed)' for opening block '\(op)'"
+                        }
+                        
+                        let innerOpening: String.Index = string.index(startBlockIndex, offsetBy: op.count)
+                        var fullBlock: String = String(string[innerOpening..<endBlockIndex])
+                        
+                        if fullBlock.hasPrefix("\r") { fullBlock.removeFirst() }
+                        if fullBlock.hasPrefix("\n") { fullBlock.removeFirst() }
+                        
+                        if fullBlock.hasSuffix("\n") {
+                            fullBlock.removeLast()
+                            if fullBlock.hasSuffix("\r") { fullBlock.removeLast() }
+                        }
+                        
+                        
+                        let outerEndBlockIndex: String.Index = string.index(endBlockIndex, offsetBy: ed.count)
+                        
+                        return CodeBlock(range: startBlockIndex..<outerEndBlockIndex,
+                                         type: b,
+                                         string: fullBlock)
+                        
+                        
+                    }
+                }
+                
+                //Didn't get anywhere
+                return nil
+            }
+            
+            
+        }
+        
+        
+        private var blockDefinitions: CodeBlockIdentifiers = CodeBlockIdentifiers(opening: "<%",
+                                                                                  closing: "%>",
+                                                                                  blocks: [CodeBlockDefinition(basic: ""),
+                                                                                           CodeBlockDefinition(inline: "="),
+                                                                                           CodeBlockDefinition(static: "!")/*,
+                                                                                           CodeBlockDefinition(variable: "@")*/])
+        
+        
+        private var source: String = ""
+        private var file: String
+        public private(set) var clsName: String
+        public private(set) var sourceEncoding: String.Encoding
+        
+        public init(file: String, className: String) throws {
+            self.file = file
+            var enc: String.Encoding = String.Encoding.utf8
+            self.source = try String(contentsOfFile: self.file, usedEncoding: &enc)
+            self.sourceEncoding = enc
+            self.clsName = className
+        }
+        
+        func strBlockToPrintCode(_ block: [String], tabs: Int) -> String {
+            var rtn: String = ""
+            
+            let strTabs: String = "\t".repeated(tabs)
+            
+            for (index, line) in block.enumerated() {
+                rtn += strTabs + "sourceBuilder += \"" + line.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                if (index < block.count - 1) { rtn += "\\n" }
+                rtn += "\""
+                rtn += "\n"
+            }
+            
+            
+            return rtn
+        }
+        
+        func generateSourceGenerator() throws -> String {
+            var generatorContent: String = ""
+            var classContent: String = ""
+            var lastBlockEnding: String.Index = self.source.startIndex
+            while let block = try blockDefinitions.nextBlockSet(from: self.source, startingAt: lastBlockEnding) {
+                lastBlockEnding = block.range.upperBound
+                if block.type.isTextBlock { // Plain text
+                    generatorContent += strBlockToPrintCode(block.lines, tabs: 2)
+                } else if block.type.isBasicBlock { // ?%...%?
+                    generatorContent += block.string + "\n"
+                } else if block.type.isInlineBlock { // ?%=..%?
+                    generatorContent += "\t\tsourceBuilder += \"\\(" + block.string + ")\"\n"
+                } else if block.type.isStaticBlock {
+                    classContent += block.string + "\n"
+                }
+            }
+            
+            var completeSource: String = "import Foundation\n\n"
+            completeSource += "public class \(clsName): NSObject {\n\n"
+            completeSource += "\tpublic override var description: String { return generate() }\n\n"
+            completeSource += classContent
+            completeSource += "\tpublic func generate() -> String {\n"
+            completeSource += "\t\tvar sourceBuilder: String = \"\"\n\n"
+            
+            completeSource += "\t\tsourceBuilder += \"//  This file was dynamically generated from '\(self.file.lastPathComponent)' by \(dSwiftModuleName).  Please do not modify directly.\\n\"\n"
+            completeSource += "\t\tsourceBuilder += \"//  \(dSwiftModuleName) can be found at \(dSwiftURL).\\n\\n\"\n"
+            completeSource += generatorContent
+            completeSource += "\n\t\treturn sourceBuilder\n"
+            completeSource += "\t}\n"
+            completeSource += "}\n"
+            
+            
+            return completeSource
+            
+        }
+    }
+    
+    private static let PACKAGE_FILE_CONTENTS: String = """
+    // swift-tools-version:4.0
+    // The swift-tools-version declares the minimum version of Swift required to build this package.
+
+    import PackageDescription
+
+    let package = Package(
+        name: "{LIBNAME}",
+        products: [
+            // Products define the executables and libraries produced by a package, and make them visible to other packages.
+            .library(
+                name: "{LIBNAME}",
+                type: .dynamic,
+                targets: ["{LIBNAME}"]),
+        ],
+        dependencies: [
+            // Dependencies declare other packages that this package depends on.
+            // .package(url: /* package url */, from: "1.0.0"),
+        ],
+        targets: [
+            // Targets are the basic building blocks of a package. A target can define a module or a test suite.
+            // Targets can depend on other targets in this package, and on products in packages which this package depends on.
+            .target(
+                name: "{LIBNAME}",
+                dependencies: []),
+        ]
+    )
+    """
+    
+    public static let PACKAGE_FILE_ENCODING: String.Encoding = String.Encoding.utf8
+    
+    
+    #if os(Linux)
+    private static let MANGLED_INIT_PREFIX: String = "_T0"
+    #else
+    private static let MANGLED_INIT_PREFIX: String = "_$S"
+    #endif
+    private static let MANGLED_INIT_SUFFIX: String = "CACycfC"
+    
+    private static let CommonLibraryName: String = "LibraryGen"
+    private var commonLibraryCounter: Int = 0
+    private let commonLibraryLock: DispatchQueue = DispatchQueue(label: "LibraryCounterLock")
+    
+    private static let CommonClassName: String = "ClassGEN"
+    private var commonClassCounter: Int = 0
+    private let commonClassLock: DispatchQueue = DispatchQueue(label: "ClassCounterLock")
+    
+    private let swiftPath: String
+    private let tempLocation: URL = { return URL(fileURLWithPath: NSTemporaryDirectory()) } ()
+    
+    public init(swiftPath: String = "/usr/bin/swift") {
+        precondition(FileManager.default.fileExists(atPath: swiftPath), "Swift at location '\(swiftPath)' is missing")
+        self.swiftPath = swiftPath
+    }
+    
+    deinit {
+        try? FileManager.default.removeItem(at: tempLocation)
+    }
+    
+    private func getNextLibraryName() -> String {
+        let idx: Int = commonLibraryLock.sync {
+            let rtn = commonLibraryCounter
+            commonLibraryCounter += 1
+            return rtn
+        }
+        return DynamicSourceCodeGenerator.CommonLibraryName + "\(idx)"
+    }
+    
+    private func getNextClassName() -> String {
+        let idx: Int = commonClassLock.sync {
+            let rtn = commonClassCounter
+            commonClassCounter += 1
+            return rtn
+        }
+        return DynamicSourceCodeGenerator.CommonClassName + "\(idx)"
+    }
+    
+    private func buildMangledInitSymble(libraryName: String, className: String) -> String {
+        var rtn: String = DynamicSourceCodeGenerator.MANGLED_INIT_PREFIX
+        rtn += "\(libraryName.count)" + libraryName
+        rtn += "\(className.count)" + className
+        rtn += DynamicSourceCodeGenerator.MANGLED_INIT_SUFFIX
+        return rtn
+    }
+    
+    private func which(_ cmd: String) -> String? {
+        
+        guard let envStr = ProcessInfo.processInfo.environment["PATH"] else { return nil }
+        
+        let paths = envStr.split(separator: ":").map({String($0)})
+        for p in paths {
+            var cmdPath: String = p
+            if !cmdPath.hasSuffix("/") { cmdPath += "/" }
+            cmdPath += cmd
+            if FileManager.default.fileExists(atPath: cmdPath) {
+                return cmdPath
+            }
+        }
+        return nil
+    }
+    
+    #if os(macOS)
+    private func processLibFrom(libName: String, className: String, libBin: URL) throws -> String {
+        
+        let workingFolder: URL = libBin.deletingLastPathComponent()
+        let frameworkFolder: URL = workingFolder.appendingPathComponent(libName + ".framework", isDirectory: true)
+        let frameworkBin: URL = frameworkFolder.appendingPathComponent(libName, isDirectory: false)
+        try FileManager.default.createDirectory(at: frameworkFolder, withIntermediateDirectories: false, attributes: [:])
+        try FileManager.default.copyItem(at: libBin, to: frameworkBin)
+        
+        let modulesFolder: URL = frameworkFolder.appendingPathComponent("Modules", isDirectory: true)
+        try FileManager.default.createDirectory(at: modulesFolder, withIntermediateDirectories: false, attributes: [:])
+        let subModulesFolder: URL = modulesFolder.appendingPathComponent(libName + ".swiftmodule", isDirectory: true)
+        try FileManager.default.createDirectory(at: subModulesFolder, withIntermediateDirectories: false, attributes: [:])
+        
+        let platform: String = "x86_64" // This should be dynamically calculated
+        let srcSwiftDock: URL = workingFolder.appendingPathComponent(libName + ".swiftdoc", isDirectory: false)
+        let destSwiftDock: URL = subModulesFolder.appendingPathComponent(platform + ".swiftdoc", isDirectory: false)
+        try FileManager.default.copyItem(at: srcSwiftDock, to: destSwiftDock)
+        
+        let srcSwiftModule: URL = workingFolder.appendingPathComponent(libName + ".swiftmodule", isDirectory: false)
+        let destSwiftModule: URL = subModulesFolder.appendingPathComponent(platform + ".swiftmodule", isDirectory: false)
+        try FileManager.default.copyItem(at: srcSwiftModule, to: destSwiftModule)
+        
+        let headerFolder: URL = frameworkFolder.appendingPathComponent("Headers", isDirectory: true)
+        try FileManager.default.createDirectory(at: headerFolder, withIntermediateDirectories: false, attributes: [:])
+        
+        let resourcesFolder: URL = frameworkFolder.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resourcesFolder, withIntermediateDirectories: false, attributes: [:])
+        
+        let resourcesContent: String = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>BuildMachineOSBuild</key>
+    <string>18A391</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>{LIBNAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{LIBNAME}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>{LIBNAME}</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>CFBundleVersion</key>
+    <string></string>
+    <key>DTCompiler</key>
+    <string>com.apple.compilers.llvm.clang.1_0</string>
+    <key>DTPlatformBuild</key>
+    <string>10A255</string>
+    <key>DTPlatformVersion</key>
+    <string>GM</string>
+    <key>DTSDKBuild</key>
+    <string>18A384</string>
+    <key>DTSDKName</key>
+    <string>macosx10.14</string>
+    <key>DTXcode</key>
+    <string>1000</string>
+    <key>DTXcodeBuild</key>
+    <string>10A255</string>
+</dict>
+</plist>
+
+"""
+        
+        let plistStr = resourcesContent.replacingOccurrences(of: "{LIBNAME}", with: libName)
+        let plistFile: URL = resourcesFolder.appendingPathComponent("Info.plist", isDirectory: false)
+        try plistStr.write(to: plistFile, atomically: false, encoding: String.Encoding.utf8)
+        
+        
+        guard let bndl = Bundle(url: frameworkFolder) else {
+            throw "Unable to load framework"
+        }
+        guard let cls = bndl.principalClass else {
+            throw "Unable to load class"
+        }
+        guard let nsCls = cls as? NSObject.Type else {
+            throw "Unable to cast class"
+        }
+        let c = nsCls.init()
+        return c.description
+
+        
+    }
+    #else
+    private func processLibFrom(libName: String, className: String, libBin: URL) throws -> String {
+        guard let openRes = dlopen(libBin.path, RTLD_NOW|RTLD_LOCAL) else {
+            throw "Unable to load lib '\(libBin.path)'"
+        }
+        
+        defer { dlclose(openRes) }
+        
+        
+        let symbolName: String = self.buildMangledInitSymble(libraryName: libName, className: className)
+        
+        guard let sym = dlsym(openRes, symbolName) else {
+            
+            let task2 = Process()
+            
+            let pipe2 = Pipe()
+            
+            task2.launchPath = which("nm")!
+            task2.arguments = [libBin.path]
+            task2.standardOutput = pipe2
+            task2.standardError = pipe2
+            
+            
+            task2.launch()
+            task2.waitUntilExit()
+            
+            
+            var erLn2: String = ""
+            let nmData = pipe2.fileHandleForReading.readDataToEndOfFile()
+            if let nmStr = String(data: nmData, encoding: .utf8) {
+                erLn2 += ".\n" + nmStr
+            }
+            
+            
+            let dError: String = String(cString:  dlerror())
+            
+            throw "\(dError). Could not find constructor symbol '\(symbolName)' in '\(libBin.path)'" + erLn2
+        }
+        
+        let f: InitFunction = unsafeBitCast(sym, to: InitFunction.self)
+        
+        guard let generator = f() as? NSObject else  {
+         throw "Could not create class"
+         }
+         
+         let src: String = generator.description
+        return src
+    }
+    #endif
+    public func generateSource(from sourcePath: String) throws -> (source: String, encoding: String.Encoding) {
+        precondition(FileManager.default.fileExists(atPath: sourcePath), "Source file '\(sourcePath)' does not exist")
+        let libName: String = getNextLibraryName()
+        let clsName: String = getNextClassName()
+        
+        let libraryDestination = tempLocation.appendingPathComponent(libName, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: libraryDestination)
+        }
+        
+        if FileManager.default.fileExists(atPath: libraryDestination.path) {
+            do {
+                //If library location already exists we'll try and remove it.
+                try FileManager.default.removeItem(at: libraryDestination)
+            } catch {
+                throw "Could no clean library folder '\(libraryDestination.path)' before use"
+            }
+        }
+        
+        do {
+            try FileManager.default.createDirectory(at: libraryDestination, withIntermediateDirectories: false)
+        } catch {
+            throw "Could not create library folder '\(libraryDestination.path)' for use"
+        }
+        
+        
+        let sourceFolder = libraryDestination.appendingPathComponent("Sources", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: false)
+        } catch {
+            throw "Could not create library source folder '\(sourceFolder.path)' for use"
+        }
+        
+        let libSourceFolder = sourceFolder.appendingPathComponent(libName, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: libSourceFolder, withIntermediateDirectories: false)
+        } catch {
+            throw "Could not create library source folder '\(libSourceFolder.path)' for use"
+        }
+        
+        let packageSourceCode = DynamicSourceCodeGenerator.PACKAGE_FILE_CONTENTS.replacingOccurrences(of: "{LIBNAME}", with: libName)
+        let packageFileName = libraryDestination.appendingPathComponent("Package.swift", isDirectory: false)
+        
+        do {
+            try packageSourceCode.write(to: packageFileName, atomically: false, encoding: DynamicSourceCodeGenerator.PACKAGE_FILE_ENCODING)
+        } catch {
+            throw "Unabel to write 'Package.swift' to '\(libraryDestination.path)' folder"
+        }
+        
+        
+        let srcBuilderSrc: String!
+        let srcBuilderEnc: String.Encoding!
+        do {
+            let builder = try DynamicSourceCodeBuilder(file: sourcePath, className: clsName)
+            srcBuilderSrc = try builder.generateSourceGenerator()
+            srcBuilderEnc = builder.sourceEncoding
+        } catch {
+            throw "Unabe to generate source code for file '\(sourcePath)'"
+        }
+        
+        let classFileName = libSourceFolder.appendingPathComponent("\(clsName).swift", isDirectory: false)
+        do {
+            try srcBuilderSrc.write(to: classFileName, atomically: false, encoding: srcBuilderEnc)
+        } catch {
+            throw "Unabel to write '\(clsName).swift' to '\(libSourceFolder.path)' folder"
+        }
+        
+        let task = Process()
+        
+        let pipe = Pipe()
+        
+        task.launchPath = self.swiftPath
+        task.arguments = ["build", "--no-static-swift-stdlib"]
+        task.currentDirectoryPath = libraryDestination.path
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        
+        task.launch()
+        task.waitUntilExit()
+        
+        if task.terminationStatus != 0 {
+            var errStr: String = ""
+            let errDta = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let e = String(data: errDta, encoding: .utf8) {
+                errStr = "\n" + e
+            }
+            throw "Building Library for '\(sourcePath)' failed.\(task.terminationStatus).\(errStr)"
+        }
+        
+        let libPathData = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard var libPathStr = String(data: libPathData, encoding: .utf8) else {
+            throw "Unable to read Linking path from stdout"
+        }
+        
+        guard libPathStr.contains("\nLinking ") else {
+            throw "Invalid Linking path '\(libPathStr)'"
+        }
+        
+        let libPathLines = libPathStr.split(separator: "\n").map({String($0)})
+        for l in libPathLines {
+            if l.hasPrefix("Linking ") {
+                libPathStr = String(l)
+                if libPathStr.hasSuffix("\n") {
+                    libPathStr.removeLast()
+                    if libPathStr.hasSuffix("\r") { libPathStr.removeLast() }
+                }
+            }
+        }
+        
+        guard libPathStr.hasPrefix("Linking ") else {
+            throw "Invalid Linking path '\(libPathStr)'"
+        }
+        
+        libPathStr = String(libPathStr.suffix(from: libPathStr.index(libPathStr.startIndex, offsetBy: "Linking ".count)))
+        
+        var libBin = libraryDestination
+        if !libPathStr.hasPrefix("/") {
+            //if libPathStr.hasPrefix("./") { libPathStr.removeFirst(2) }
+            //if libPathStr.hasPrefix("~/")
+            libBin.appendPathComponent(libPathStr)
+            libBin.standardize()
+        }
+        else { libBin = URL(fileURLWithPath: libPathStr, isDirectory: false) }
+        
+        let src = try processLibFrom(libName: libName, className: clsName, libBin: libBin)
+        return (source: src, encoding: srcBuilderEnc)
+        
+        
+    }
+    
+    public func generateSource(from source: URL) throws -> (String, String.Encoding) {
+        guard source.isFileURL else { throw "source must be a file url" }
+        return try self.generateSource(from: source.path)
+    }
+    
+    public func generateSource(from sourcePath: String, to destinationPath: String) throws {
+        let s = try generateSource(from: sourcePath)
+        if FileManager.default.fileExists(atPath: destinationPath) { try FileManager.default.removeItem(atPath: destinationPath) }
+        try s.source.write(toFile: destinationPath, atomically: false, encoding: s.encoding)
+    }
+    
+    public func generateSource(from source: URL, to destination: URL) throws {
+        guard source.isFileURL else { throw "source must be a file url" }
+        guard destination.isFileURL else { throw "destination must be a file url" }
+        try generateSource(from: source.path, to: destination.path)
+    }
+}
+
+
+
+
+func processFile(generator: DynamicSourceCodeGenerator, file source: URL, rebuild: Bool) throws -> (destination: URL, updated: Bool, created: Bool) {
+    let destination = source.deletingPathExtension().appendingPathExtension("swift")
+    let destExists = FileManager.default.fileExists(atPath: destination.path)
+    var doBuild: Bool = !destExists
+    if !doBuild {
+        
+        if let srcMod = source.pathModificationDate, let desMod = destination.pathModificationDate {
+            if srcMod > desMod { doBuild = true }
+        } else {
+            doBuild = true
+        }
+    }
+    
+    //doBuild = true
+    var updated: Bool = false
+    var created: Bool = false
+    
+    if doBuild || rebuild {
+        do {
+            try generator.generateSource(from: source, to: destination)
+            if destExists { updated = true }
+            else { created = true }
+        } catch {
+            // Removing destination because something failed
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+    
+    return (destination: destination, updated: updated, created: created)
+}
+
+func processFolder(generator: DynamicSourceCodeGenerator, fileExtension: String, folder: URL, rebuild: Bool) throws {
+    let children = try FileManager.default.contentsOfDirectory(at: folder,
+                                                               includingPropertiesForKeys: nil)
+    var folders: [URL] = []
+    for child in children {
+        if let r = try? child.checkResourceIsReachable(), r {
+            
+            guard !child.isPathDirectory else {
+                folders.append(child)
+                continue
+            }
+            guard child.isPathFile else { continue }
+            
+            if child.pathExtension.lowercased() == fileExtension.lowercased() {
+                do {
+                    let modifications = try processFile(generator: generator, file: child, rebuild: rebuild)
+                    if modifications.created { print("Created file '\(modifications.destination.path)'") }
+                    else if modifications.updated { print("Updated file '\(modifications.destination.path)'") }
+                    else { print("No updates needed for file '\(modifications.destination.path)'") }
+                } catch {
+                    print("Failed to process file '\(child.path)'")
+                    print(error)
+                }
+            }
+        }
+        
+        
+        
+    }
+    
+    for subFolder in folders {
+        try processFolder(generator: generator, fileExtension: fileExtension, folder: subFolder, rebuild: rebuild)
+    }
+}
+
+func cleanFolder(fileExtension: String, folder: URL) throws {
+    let children = try FileManager.default.contentsOfDirectory(at: folder,
+                                                               includingPropertiesForKeys: nil)
+    var folders: [URL] = []
+    for child in children {
+        if let r = try? child.checkResourceIsReachable(), r {
+            
+            guard !child.isPathDirectory else {
+                folders.append(child)
+                continue
+            }
+            guard child.isPathFile else { continue }
+            
+            if child.pathExtension.lowercased() == fileExtension.lowercased() {
+                let generatedFile = child.deletingPathExtension().appendingPathExtension("swift")
+                if let gR = try? generatedFile.checkResourceIsReachable(), gR {
+                    
+                    do {
+                        
+                        try FileManager.default.removeItem(at: generatedFile)
+                        print("Removed generated file '\(generatedFile.path)'")
+                        
+                    } catch {
+                        print("Unable to remove generated file '\(generatedFile.path)'")
+                        print(error)
+                    }
+                }
+            }
+        }
+        
+        
+        
+    }
+    
+    for subFolder in folders {
+        try cleanFolder(fileExtension: fileExtension, folder: subFolder)
+    }
+}
+
+
+struct PackageDescription: Codable {
+    struct Target: Codable {
+        let c99name: String
+        let module_type: String
+        let name: String
+        let path: String
+        let sources: [String]
+        let type: String
+    }
+    
+    let name: String
+    let path: String
+    let targets: [Target]
+}
+
+func getPackageDescription(swiftPath: String = "/usr/bin/swift",
+                           packagePath: String = FileManager.default.currentDirectoryPath) throws -> PackageDescription {
+    
+    precondition(FileManager.default.fileExists(atPath: swiftPath), "Swift at location '\(swiftPath)' is missing")
+    precondition(FileManager.default.fileExists(atPath: packagePath), "Package folder '\(packagePath)' is missing")
+    let packageFileURL = URL(fileURLWithPath: packagePath).appendingPathComponent("Package.swift")
+    precondition(FileManager.default.fileExists(atPath: packageFileURL.path), "Package.swift file '\(packageFileURL.path)' is missing")
+    
+    
+    let task = Process()
+    
+    task.launchPath = swiftPath
+    task.arguments = ["package", "describe", "--type", "json"]
+    task.currentDirectoryPath = packagePath
+    
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardOutput = pipe
+    
+    task.launch()
+    task.waitUntilExit()
+    
+    if task.terminationStatus != 0 {
+        throw "Could not get package description for '\(packagePath)'"
+    }
+    
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    
+    
+    let decoder = JSONDecoder()
+    do {
+        return try decoder.decode(PackageDescription.self, from: data)
+    } catch {
+        print(error)
+        if let output = String(data: data, encoding: .utf8)  {
+            print(output)
+         }
+        throw "Unable to transform package description into objects"
+    }
+    
+}
+
+func printUssage() {
+    print("Dynamic Swift compiles .dswift files into .swift files")
+    print("Dynamic Swift files are like JSP or ASP files.  But use swift as the coding languge and expect the resutls to be swift code for your project")
+    print("Usage: dswift build")
+    print("Usage: dswift build {target}")
+    print("Usage: dswift rebuild")
+    print("Usage: dswift rebuild {target}")
+    print("Usage: dswift package clean")
+    print("Usage: dswift package clean {target}")
+}
+
+func printUssageAndExit() -> Never {
+    printUssage()
+    exit(1)
+}
+
+guard CommandLine.arguments.count > 1 else {
+    printUssageAndExit()
+}
+
+guard CommandLine.arguments[1].lowercased() == "package" || CommandLine.arguments[1].lowercased() == "build" || CommandLine.arguments[1].lowercased() == "rebuild" else {
+    printUssageAndExit()
+}
+
+let packageDetails = try getPackageDescription()
+let DynamicSwiftFileExtension: String = "dswift"
+
+if CommandLine.arguments[1].lowercased() == "package" {
+    guard CommandLine.arguments.count >= 3 else {
+        printUssageAndExit()
+    }
+    
+    guard CommandLine.arguments[2].lowercased() == "clean" else {
+        printUssageAndExit()
+    }
+    
+    var target: String? = nil
+    if CommandLine.arguments.count == 4 {
+        target = CommandLine.arguments[3].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    var hasProcessedTarget: Bool = false
+    for t in packageDetails.targets {
+        if target == nil || target!.lowercased() == t.name.lowercased() {
+            hasProcessedTarget = true
+            //sprint("Looking at target: \(t.name)")
+            let targetPath = URL(fileURLWithPath: t.path, isDirectory: true)
+            try cleanFolder(fileExtension: DynamicSwiftFileExtension, folder: targetPath)
+        }
+    }
+    if let tg = target,  !hasProcessedTarget {
+        printUssage()
+        var targetError: String = "\tTarget '\(tg)' not found."
+        
+        if packageDetails.targets.count > 0 {
+            var availableTargets: String = packageDetails.targets.reduce("", { return $0 + ", " + $1.name })
+            availableTargets.removeFirst()
+            targetError += " Available targets are: \(availableTargets)"
+        }
+        
+        
+        print(targetError)
+        
+    }
+    
+    
+    
+} else {
+
+    var target: String? = nil
+    if CommandLine.arguments.count == 3 {
+        target = CommandLine.arguments[2].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    
+    let generator = DynamicSourceCodeGenerator()
+
+    var hasProcessedTarget: Bool = false
+    for t in packageDetails.targets {
+        if target == nil || target!.lowercased() == t.name.lowercased() {
+            hasProcessedTarget = true
+            //sprint("Looking at target: \(t.name)")
+            let targetPath = URL(fileURLWithPath: t.path, isDirectory: true)
+            try processFolder(generator: generator, fileExtension: DynamicSwiftFileExtension, folder: targetPath, rebuild: (CommandLine.arguments[1].lowercased() == "rebuild"))
+        }
+    }
+    if let tg = target,  !hasProcessedTarget {
+        printUssage()
+        var targetError: String = "\tTarget '\(tg)' not found."
+        
+        if packageDetails.targets.count > 0 {
+            var availableTargets: String = packageDetails.targets.reduce("", { return $0 + ", " + $1.name })
+            availableTargets.removeFirst()
+            targetError += " Available targets are: \(availableTargets)"
+        }
+        
+        
+        print(targetError)
+        
+    }
+}
+
+
+
+
