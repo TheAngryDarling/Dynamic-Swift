@@ -586,6 +586,7 @@ class DynamicSourceCodeGenerator {
         guard let bndl = Bundle(url: frameworkFolder) else {
             throw "Unable to load framework"
         }
+        defer { bndl.unload() }
         guard let cls = bndl.principalClass else {
             throw "Unable to load class"
         }
