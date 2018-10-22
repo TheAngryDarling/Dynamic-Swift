@@ -24,9 +24,15 @@ typealias InitFunction = @convention(c) () -> AnyObject
 let dSwiftModuleName: String = "dswift"
 let dSwiftURL: String = "https://github.com/TheAngryDarling/Dynamic-Swift"
 
+var verbose: Bool = false
+
 func print(_ msg: String) {
     Swift.print(msg)
     fflush(stdout)
+}
+
+func verbosePrint(_ msg: String) {
+	if verbose { print(msg) }
 }
 
 
@@ -125,6 +131,22 @@ extension String {
         return r.lowerBound
     }
     #endif
+	
+	static func random(length: Int = 20) -> String {
+        let base = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        var randomString: String = ""
+
+        for _ in 0..<length {
+			#if os(Linux)
+	        let randomValue = Foundation.random() % base.count
+	        #else
+	        let randomValue = Int(arc4random_uniform(UInt32(base.count)))
+	        #endif
+            //let randomValue = arc4random_uniform(UInt32(base.count))
+            randomString += "\(base[base.index(base.startIndex, offsetBy: Int(randomValue))])"
+        }
+        return randomString
+    }
 }
 
 class DynamicSourceCodeGenerator {
@@ -448,7 +470,7 @@ class DynamicSourceCodeGenerator {
     private let commonClassLock: DispatchQueue = DispatchQueue(label: "ClassCounterLock")
     
     private let swiftPath: String
-    private let tempLocation: URL = { return URL(fileURLWithPath: NSTemporaryDirectory()) } ()
+    private let tempLocation: URL = { return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(String.random(), isDirectory: true) } ()
     
     public init(swiftPath: String = "/usr/bin/swift") {
         precondition(FileManager.default.fileExists(atPath: swiftPath), "Swift at location '\(swiftPath)' is missing")
@@ -617,6 +639,9 @@ class DynamicSourceCodeGenerator {
             
             task2.launchPath = which("nm")!
             task2.arguments = [libBin.path]
+			#if os(macOS)
+			task2.standardInput = FileHandle.nullDevice
+			#endif
             task2.standardOutput = pipe2
             task2.standardError = pipe2
             
@@ -667,10 +692,12 @@ class DynamicSourceCodeGenerator {
         }
         
         do {
-            try FileManager.default.createDirectory(at: libraryDestination, withIntermediateDirectories: false)
+            try FileManager.default.createDirectory(at: libraryDestination, withIntermediateDirectories: true)
         } catch {
             throw "Could not create library folder '\(libraryDestination.path)' for use"
         }
+		
+		verbosePrint("Created temp library folder \(libraryDestination.path)")
         
         
         let sourceFolder = libraryDestination.appendingPathComponent("Sources", isDirectory: true)
@@ -714,6 +741,7 @@ class DynamicSourceCodeGenerator {
             throw "Unabel to write '\(clsName).swift' to '\(libSourceFolder.path)' folder"
         }
         
+		verbosePrint("Compiling generator")
         let task = Process()
         
         let pipe = Pipe()
@@ -721,6 +749,9 @@ class DynamicSourceCodeGenerator {
         task.launchPath = self.swiftPath
         task.arguments = ["build", "--no-static-swift-stdlib"]
         task.currentDirectoryPath = libraryDestination.path
+		#if os(macOS)
+		task.standardInput = FileHandle.nullDevice
+		#endif
         task.standardOutput = pipe
         task.standardError = pipe
         
@@ -729,6 +760,7 @@ class DynamicSourceCodeGenerator {
         task.waitUntilExit()
         
         if task.terminationStatus != 0 {
+			verbosePrint("There was an error")
             var errStr: String = ""
             let errDta = pipe.fileHandleForReading.readDataToEndOfFile()
             if let e = String(data: errDta, encoding: .utf8) {
@@ -736,6 +768,8 @@ class DynamicSourceCodeGenerator {
             }
             throw "Building Library for '\(sourcePath)' failed.\(task.terminationStatus).\(errStr)"
         }
+		
+		verbosePrint("Compiling completed")
         
         let libPathData = pipe.fileHandleForReading.readDataToEndOfFile()
         guard var libPathStr = String(data: libPathData, encoding: .utf8) else {
@@ -800,6 +834,7 @@ class DynamicSourceCodeGenerator {
 
 
 func processFile(generator: DynamicSourceCodeGenerator, file source: URL, rebuild: Bool) throws -> (destination: URL, updated: Bool, created: Bool) {
+	verbosePrint("Processing file \(source.path)")
     let destination = source.deletingPathExtension().appendingPathExtension("swift")
     let destExists = FileManager.default.fileExists(atPath: destination.path)
     var doBuild: Bool = !destExists
@@ -832,6 +867,7 @@ func processFile(generator: DynamicSourceCodeGenerator, file source: URL, rebuil
 }
 
 func processFolder(generator: DynamicSourceCodeGenerator, fileExtension: String, folder: URL, rebuild: Bool) throws {
+	verbosePrint("Looking at path: \(folder.path)")
     let children = try FileManager.default.contentsOfDirectory(at: folder,
                                                                includingPropertiesForKeys: nil)
     var folders: [URL] = []
@@ -867,6 +903,7 @@ func processFolder(generator: DynamicSourceCodeGenerator, fileExtension: String,
 }
 
 func cleanFolder(fileExtension: String, folder: URL) throws {
+	verbosePrint("Looking at path: \(folder.path)")
     let children = try FileManager.default.contentsOfDirectory(at: folder,
                                                                includingPropertiesForKeys: nil)
     var folders: [URL] = []
@@ -937,6 +974,9 @@ func getPackageDescription(swiftPath: String = "/usr/bin/swift",
     task.currentDirectoryPath = packagePath
     
     let pipe = Pipe()
+	#if os(macOS)
+	task.standardInput = FileHandle.nullDevice
+	#endif
     task.standardOutput = pipe
     task.standardOutput = pipe
     
@@ -979,6 +1019,9 @@ func printUssageAndExit() -> Never {
     exit(1)
 }
 
+//verbose = true
+verbosePrint("Running dswift...")
+
 guard CommandLine.arguments.count > 1 else {
     printUssageAndExit()
 }
@@ -987,7 +1030,10 @@ guard CommandLine.arguments[1].lowercased() == "package" || CommandLine.argument
     printUssageAndExit()
 }
 
+verbosePrint("Loading package details")
 let packageDetails = try getPackageDescription()
+verbosePrint("Package details loaded")
+verbosePrint("\(packageDetails.targets.count) target(s) available")
 let DynamicSwiftFileExtension: String = "dswift"
 
 if CommandLine.arguments[1].lowercased() == "package" {
@@ -1006,9 +1052,9 @@ if CommandLine.arguments[1].lowercased() == "package" {
     
     var hasProcessedTarget: Bool = false
     for t in packageDetails.targets {
-        if target == nil || target!.lowercased() == t.name.lowercased() {
+        if (target == nil && t.type != "test") || (target != nil && target!.lowercased() == t.name.lowercased()) {
             hasProcessedTarget = true
-            //sprint("Looking at target: \(t.name)")
+            verbosePrint("Looking at target: \(t.name)")
             let targetPath = URL(fileURLWithPath: t.path, isDirectory: true)
             try cleanFolder(fileExtension: DynamicSwiftFileExtension, folder: targetPath)
         }
@@ -1042,9 +1088,9 @@ if CommandLine.arguments[1].lowercased() == "package" {
 
     var hasProcessedTarget: Bool = false
     for t in packageDetails.targets {
-        if target == nil || target!.lowercased() == t.name.lowercased() {
+        if (target == nil && t.type != "test") || (target != nil && target!.lowercased() == t.name.lowercased()) {
             hasProcessedTarget = true
-            //sprint("Looking at target: \(t.name)")
+            verbosePrint("Looking at target: \(t.name)")
             let targetPath = URL(fileURLWithPath: t.path, isDirectory: true)
             try processFolder(generator: generator, fileExtension: DynamicSwiftFileExtension, folder: targetPath, rebuild: (CommandLine.arguments[1].lowercased() == "rebuild"))
         }
@@ -1064,7 +1110,3 @@ if CommandLine.arguments[1].lowercased() == "package" {
         
     }
 }
-
-
-
-
