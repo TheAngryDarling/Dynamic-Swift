@@ -3,6 +3,7 @@
 ![Linux](https://img.shields.io/badge/os-linux-green.svg?style=flat)
 ![Apache 2](https://img.shields.io/badge/license-Apache2-blue.svg?style=flat)
 
+Note: This project is phased out and has been replaced with [dswift](https://github.com/TheAngryDarling/dswift)
 
 ## dswift
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;A shell script that dynamically generates swift code from .dswift files within SwiftPM projects<br/>
